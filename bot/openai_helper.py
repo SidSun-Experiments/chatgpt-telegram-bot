@@ -109,7 +109,7 @@ class OpenAIHelper:
         :param plugin_manager: The plugin manager
         """
         http_client = httpx.AsyncClient(proxies=config['proxy']) if 'proxy' in config else None
-        self.client = openai.AsyncOpenAI(api_key=config['api_key'], http_client=http_client)
+        self.client = openai.AsyncOpenAI(base_url=os.environ.get("OPENAI_BASE_URL"),api_key=config['api_key'], http_client=http_client)
         self.config = config
         self.plugin_manager = plugin_manager
         self.conversations: dict[int: list] = {}  # {chat_id: history}
@@ -178,19 +178,23 @@ class OpenAIHelper:
         """
         plugins_used = ()
         response = await self.__common_get_chat_response(chat_id, query, stream=True)
-        if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
-            response, plugins_used = await self.__handle_function_call(chat_id, response, stream=True)
-            if is_direct_result(response):
-                yield response, '0'
-                return
 
         answer = ''
-        async for chunk in response:
-            if len(chunk.choices) == 0:
+        # This replaces the for loop in the previous implementation
+        # The reason for this is that the previous implementation would drop the first token / chunk of the response
+        # The chunk never made it to the loop, so the first token was always lost
+        # We now use the underlying httpx.AsyncStream - this allows us to get the first chunk
+        # But breaks compatibility with enable_functions or such.
+        async for bytes in response.response.aiter_bytes():
+            chunk = bytes.decode('utf-8')
+            stripped = chunk.lstrip("data: ").rstrip("data: [DONE]\n\n")
+            res = json.loads(stripped)
+            if res.get('request_id', "") != "" or len(res.get('choices', [])) == 0:
                 continue
-            delta = chunk.choices[0].delta
-            if delta.content:
-                answer += delta.content
+            if res['choices'][0].get('finish_reason', '') == 'stop':
+                break
+            if res['choices'][0].get('delta', '') != '':
+                answer += res['choices'][0]['delta']['content']
                 yield answer, 'not_finished'
         answer = answer.strip()
         self.__add_to_history(chat_id, role="assistant", content=answer)
@@ -213,7 +217,7 @@ class OpenAIHelper:
         wait=wait_fixed(20),
         stop=stop_after_attempt(3)
     )
-    async def __common_get_chat_response(self, chat_id: int, query: str, stream=False):
+    async def __common_get_chat_response(self, chat_id: int, query: str, stream=False) -> openai.AsyncStream:
         """
         Request a response from the GPT model.
         :param chat_id: The chat ID
@@ -230,21 +234,21 @@ class OpenAIHelper:
             self.__add_to_history(chat_id, role="user", content=query)
 
             # Summarize the chat history if it's too long to avoid excessive token usage
-            token_count = self.__count_tokens(self.conversations[chat_id])
-            exceeded_max_tokens = token_count + self.config['max_tokens'] > self.__max_model_tokens()
-            exceeded_max_history_size = len(self.conversations[chat_id]) > self.config['max_history_size']
+            # token_count = self.__count_tokens(self.conversations[chat_id])
+            # exceeded_max_tokens = token_count + self.config['max_tokens'] > self.__max_model_tokens()
+            # exceeded_max_history_size = len(self.conversations[chat_id]) > self.config['max_history_size']
 
-            if exceeded_max_tokens or exceeded_max_history_size:
-                logging.info(f'Chat history for chat ID {chat_id} is too long. Summarising...')
-                try:
-                    summary = await self.__summarise(self.conversations[chat_id][:-1])
-                    logging.debug(f'Summary: {summary}')
-                    self.reset_chat_history(chat_id, self.conversations[chat_id][0]['content'])
-                    self.__add_to_history(chat_id, role="assistant", content=summary)
-                    self.__add_to_history(chat_id, role="user", content=query)
-                except Exception as e:
-                    logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
-                    self.conversations[chat_id] = self.conversations[chat_id][-self.config['max_history_size']:]
+            # if exceeded_max_tokens or exceeded_max_history_size:
+            #     logging.info(f'Chat history for chat ID {chat_id} is too long. Summarising...')
+            #     try:
+            #         summary = await self.__summarise(self.conversations[chat_id][:-1])
+            #         logging.debug(f'Summary: {summary}')
+            #         self.reset_chat_history(chat_id, self.conversations[chat_id][0]['content'])
+            #         self.__add_to_history(chat_id, role="assistant", content=summary)
+            #         self.__add_to_history(chat_id, role="user", content=query)
+            #     except Exception as e:
+            #         logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
+            #         self.conversations[chat_id] = self.conversations[chat_id][-self.config['max_history_size']:]
 
             common_args = {
                 'model': self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model'],
@@ -621,23 +625,9 @@ class OpenAIHelper:
         return response.choices[0].message.content
 
     def __max_model_tokens(self):
-        base = 4096
-        if self.config['model'] in GPT_3_MODELS:
-            return base
-        if self.config['model'] in GPT_3_16K_MODELS:
-            return base * 4
-        if self.config['model'] in GPT_4_MODELS:
-            return base * 2
-        if self.config['model'] in GPT_4_32K_MODELS:
-            return base * 8
-        if self.config['model'] in GPT_4_VISION_MODELS:
-            return base * 31
-        if self.config['model'] in GPT_4_128K_MODELS:
-            return base * 31
-        raise NotImplementedError(
-            f"Max tokens for model {self.config['model']} is not implemented yet."
-        )
-
+        base = 8192
+        return base
+        
     # https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
     def __count_tokens(self, messages) -> int:
         """
@@ -645,40 +635,7 @@ class OpenAIHelper:
         :param messages: the messages to send
         :return: the number of tokens required
         """
-        model = self.config['model']
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-        except KeyError:
-            encoding = tiktoken.get_encoding("gpt-3.5-turbo")
-
-        if model in GPT_3_MODELS + GPT_3_16K_MODELS:
-            tokens_per_message = 4  # every message follows <|start|>{role/name}\n{content}<|end|>\n
-            tokens_per_name = -1  # if there's a name, the role is omitted
-        elif model in GPT_4_MODELS + GPT_4_32K_MODELS + GPT_4_VISION_MODELS + GPT_4_128K_MODELS:
-            tokens_per_message = 3
-            tokens_per_name = 1
-        else:
-            raise NotImplementedError(f"""num_tokens_from_messages() is not implemented for model {model}.""")
-        num_tokens = 0
-        for message in messages:
-            num_tokens += tokens_per_message
-            for key, value in message.items():
-                if key == 'content':
-                    if isinstance(value, str):
-                        num_tokens += len(encoding.encode(value))
-                    else:
-                        for message1 in value:
-                            if message1['type'] == 'image_url':
-                                image = decode_image(message1['image_url']['url'])
-                                num_tokens += self.__count_tokens_vision(image)
-                            else:
-                                num_tokens += len(encoding.encode(message1['text']))
-                else:
-                    num_tokens += len(encoding.encode(value))
-                    if key == "name":
-                        num_tokens += tokens_per_name
-        num_tokens += 3  # every reply is primed with <|start|>assistant<|message|>
-        return num_tokens
+        return 1
 
     # no longer needed
 
@@ -688,30 +645,7 @@ class OpenAIHelper:
         :param image_bytes: image to interpret
         :return: the number of tokens required
         """
-        image_file = io.BytesIO(image_bytes)
-        image = Image.open(image_file)
-        model = self.config['vision_model']
-        if model not in GPT_4_VISION_MODELS:
-            raise NotImplementedError(f"""count_tokens_vision() is not implemented for model {model}.""")
-        
-        w, h = image.size
-        if w > h: w, h = h, w
-        # this computation follows https://platform.openai.com/docs/guides/vision and https://openai.com/pricing#gpt-4-turbo
-        base_tokens = 85
-        detail = self.config['vision_detail']
-        if detail == 'low':
-            return base_tokens
-        elif detail == 'high' or detail == 'auto': # assuming worst cost for auto
-            f = max(w / 768, h / 2048)
-            if f > 1:
-                w, h = int(w / f), int(h / f)
-            tw, th = (w + 511) // 512, (h + 511) // 512
-            tiles = tw * th
-            num_tokens = base_tokens + tiles * 170
-            return num_tokens
-        else:
-            raise NotImplementedError(f"""unknown parameter detail={detail} for model {model}.""")
-
+        return 1
     # No longer works as of July 21st 2023, as OpenAI has removed the billing API
     # def get_billing_current_month(self):
     #     """Gets billed usage for current month from OpenAI API.
